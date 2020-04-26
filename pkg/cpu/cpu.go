@@ -6,8 +6,8 @@ import (
 	"math"
 	"math/bits"
 
-	"../../pkg/memory"
-	"../../pkg/utils"
+	"pkg/memory"
+	"pkg/utils"
 )
 
 type CPU struct {
@@ -76,10 +76,20 @@ func (regs *Registers) setFlag(c rune, b bool) {
 func (regs *Registers) setReg(n uint8, v uint32) {
 	regs.register[n] = v
 }
-func (regs *Registers) getReg(n uint8) uint32 {
-	return regs.register[n]
+func (regs *Registers) getRawR15() uint32{
+    return regs.register[15]
 }
-
+func (regs *Registers) getReg(n uint8) uint32 {
+    if n!=15{
+	    return regs.register[n]
+    }else{
+        return regs.register[n]+4
+        //when pc is read, pc return the instruction address + 8byte. pc is already incremented after fetch, so +4byte is required.
+    }
+}
+func (regs *Registers) incrementPC(){
+    regs.register[15]+=4
+}
 /*
 ModeBit | Mode | Accessible registers
 0b10000 | User | PC, R14 to R0, CPSR
@@ -214,11 +224,31 @@ func (cpu *CPU) execArm32(inst *InstructionArm32) error {
 	cond, name := cpu.checkCond(inst)
 	inst.Condition = name
 	switch inst.OpType {
-	case 0x0:
-		fallthrough
-	case 0x1:
+	case 0x0: //Data Processing
+		if inst.getBits(23, 24) == 2 && inst.getBit(20) == false {
+			//Miscellaneous instruction
+			return errors.New("Miscellaneous instruction is not implemented")
+		}
 		shifter, _, shname := cpu.setDPShifter(inst)
 		inst.Immediate = shname
+		if !cond {
+			return nil
+		}
+		cpu.dpxs(inst, shifter)
+	case 0x1: //Data Processing immediate
+		var imm uint32
+		imm = inst.getBits(0, 7)
+		var rotImm int
+		rotImm = int(inst.getBits(8, 11))
+		shifter := bits.RotateLeft32(imm, -2*int(rotImm))
+		shCarry := false
+		if rotImm == 0 {
+			shCarry = cpu.Regs.getFlag('C')
+		} else {
+			shCarry = getBits(shifter, 31, 31) == 1
+		}
+		cpu.Regs.setFlag('C', shCarry)
+		inst.Immediate = fmt.Sprintf("#0x%x", shifter)
 		if !cond {
 			return nil
 		}
@@ -230,11 +260,19 @@ func (cpu *CPU) execArm32(inst *InstructionArm32) error {
 		inst.Destination = dn
 		inst.Source = sn
 		cpu.doLS(inst, address)
+	case 0x4: //Load&Store multiple instructions
+		startAddr, endAddr := cpu.getLSMAddr(inst)
+		err := cpu.doLSM(inst, startAddr, endAddr)
+		if err != nil {
+			return err
+		}
 	case 0x5: //B
-		if !cond{
+		if !cond {
 			return nil
 		}
 		cpu.branch(inst)
+	default:
+		inst.Mnemonic = "UNDEFINED"
 	}
 	return nil
 }
@@ -259,136 +297,122 @@ func (cpu *CPU) execThumb(inst *InstructionThumb) error {
 	return nil
 }
 func (cpu *CPU) setDPShifter(inst *InstructionArm32) (shifter uint32, shCarry bool, name string) {
-	switch inst.getBits(25, 25) {
-	case 0: //register
-		var rm uint8
-		rm = uint8(inst.getBits(0, 3))
-		var vrm uint32
-		vrm = cpu.Regs.getReg(rm)
-		var dptyp uint8
-		dptyp = uint8(inst.getBits(4, 6))
-		switch dptyp {
-		case 0: //logical shift left by immediate
-			var shiftImm uint8
-			shiftImm = uint8(inst.getBits(7, 11))
-			shifter = utils.LoShiftL(vrm, uint8(shiftImm))
-			if shiftImm == 0 {
-				shCarry = cpu.Regs.getFlag('C')
-			} else {
-				shCarry = getBits(vrm, 32-shiftImm, 32-shiftImm) == 1
-			}
-		case 1: //logical shift left by register
-			var rs uint8
-			rs = uint8(inst.getBits(8, 11))
-			var vrs uint32
-			vrs = cpu.Regs.getReg(rs)
-			shifter = utils.LoShiftL(vrm, uint8(vrs))
-			var vrss = uint8(getBits(vrs, 0, 7))
-			if vrss == 0 {
-				shCarry = cpu.Regs.getFlag('C')
-			} else if vrss <= 32 {
-				shCarry = getBits(vrm, 32-vrss, 32-vrss) == 1
-			} else {
-				shifter = 0
-				shCarry = false
-			}
-		case 2: //logical shift right by immediate
-			var shiftImm uint8
-			shiftImm = uint8(inst.getBits(7, 11))
-			shifter = utils.LoShiftR(vrm, uint8(shiftImm))
-			if shiftImm == 0 {
-				shCarry = getBits(vrm, 31, 31) == 1
-			} else {
-				shCarry = getBits(vrm, shiftImm-1, shiftImm-1) == 1
-			}
-		case 3: //logical shift right by register
-			var rs uint8
-			rs = uint8(inst.getBits(8, 11))
-			var vrs uint32
-			vrs = cpu.Regs.getReg(rs)
-			shifter = utils.LoShiftR(vrm, uint8(vrs))
-			var vrss = uint8(getBits(vrs, 0, 7))
-			if vrss == 0 {
-				shCarry = cpu.Regs.getFlag('C')
-			} else if vrss <= 32 {
-				shCarry = getBits(vrm, vrss-1, vrss-1) == 1
-			} else {
-				shifter = 0
-				shCarry = false
-			}
-		case 4: //arithmetic shift right by immediate
-			var shiftImm uint8
-			shiftImm = uint8(inst.getBits(7, 11))
-			if shiftImm == 0 {
-				if getBits(vrm, 31, 31) == 0 {
-					shifter = 0
-					shCarry = getBits(vrm, 31, 31) == 1
-				} else {
-					shifter = 0xffffffff
-					shCarry = getBits(vrm, 31, 31) == 1
-				}
-			} else {
-				shifter = utils.ArShiftR(vrm, shiftImm)
-				shCarry = getBits(vrm, shiftImm-1, shiftImm-1) == 1
-			}
-		case 5: //arithmetic shift right by register
-			var rs uint8
-			rs = uint8(inst.getBits(8, 11))
-			var vrs uint32
-			vrs = cpu.Regs.getReg(rs)
-			shifter = utils.ArShiftR(vrm, uint8(getBits(vrs, 0, 3)))
-			var vrss = uint8(getBits(vrs, 0, 7))
-			if vrss == 0 {
-				shCarry = cpu.Regs.getFlag('C')
-			} else if vrss < 32 {
-				shCarry = getBits(vrm, vrss-1, vrss-1) == 1
-			} else {
-				if getBits(vrm, 31, 31) == 0 {
-					shifter = 0
-					shCarry = getBits(vrm, 31, 31) == 1
-				} else {
-					shifter = 0xffffffff
-					shCarry = getBits(vrm, 31, 31) == 1
-				}
-			}
-		case 6: //rotate right by immediate
-			var shiftImm uint8
-			shiftImm = uint8(inst.getBits(7, 11))
-			if shiftImm == 0 {
-				shifter = (uint32(bool2uint8(cpu.Regs.getFlag('C'))) << 31) | (vrm >> 1)
-				shCarry = getBits(vrm, 0, 0) == 1
-			} else {
-				shifter = bits.RotateLeft32(vrm, -1*int(shiftImm))
-				shCarry = getBits(vrm, shiftImm-1, shiftImm-1) == 1
-			}
-
-		case 7: //rotate right by register
-			var rs uint8
-			rs = uint8(inst.getBits(8, 11))
-			var vrs uint32
-			vrs = cpu.Regs.getReg(rs)
-			var vrss = uint8(getBits(vrs, 0, 7))
-			if vrss == 0 {
-				shifter = vrm
-				shCarry = cpu.Regs.getFlag('C')
-			} else if getBits(vrs, 0, 4) == 0 {
-				shifter = vrm
-				shCarry = getBits(vrm, 31, 31) == 1
-			} else {
-				shifter = bits.RotateLeft32(vrm, -1*int(getBits(vrs, 0, 4)))
-				shCarry = getBits(vrm, uint8(getBits(vrs, 0, 4)-1), uint8(getBits(vrs, 0, 4))) == 1
-			}
-		}
-	case 1: //immediate
-		var imm uint32
-		imm = inst.getBits(0, 7)
-		var rotImm int
-		rotImm = int(inst.getBits(8, 11))
-		shifter = bits.RotateLeft32(imm, -2*int(rotImm))
-		if rotImm == 0 {
+	var rm uint8
+	rm = uint8(inst.getBits(0, 3))
+	var vrm uint32
+	vrm = cpu.Regs.getReg(rm)
+	var dptyp uint8
+	dptyp = uint8(inst.getBits(4, 6))
+	switch dptyp {
+	case 0: //logical shift left by immediate
+		var shiftImm uint8
+		shiftImm = uint8(inst.getBits(7, 11))
+		shifter = utils.LoShiftL(vrm, uint8(shiftImm))
+		if shiftImm == 0 {
 			shCarry = cpu.Regs.getFlag('C')
 		} else {
-			shCarry = getBits(shifter, 31, 31) == 1
+			shCarry = getBits(vrm, 32-shiftImm, 32-shiftImm) == 1
+		}
+	case 1: //logical shift left by register
+		var rs uint8
+		rs = uint8(inst.getBits(8, 11))
+		var vrs uint32
+		vrs = cpu.Regs.getReg(rs)
+		shifter = utils.LoShiftL(vrm, uint8(vrs))
+		var vrss = uint8(getBits(vrs, 0, 7))
+		if vrss == 0 {
+			shCarry = cpu.Regs.getFlag('C')
+		} else if vrss <= 32 {
+			shCarry = getBits(vrm, 32-vrss, 32-vrss) == 1
+		} else {
+			shifter = 0
+			shCarry = false
+		}
+	case 2: //logical shift right by immediate
+		var shiftImm uint8
+		shiftImm = uint8(inst.getBits(7, 11))
+		shifter = utils.LoShiftR(vrm, uint8(shiftImm))
+		if shiftImm == 0 {
+			shCarry = getBits(vrm, 31, 31) == 1
+		} else {
+			shCarry = getBits(vrm, shiftImm-1, shiftImm-1) == 1
+		}
+	case 3: //logical shift right by register
+		var rs uint8
+		rs = uint8(inst.getBits(8, 11))
+		var vrs uint32
+		vrs = cpu.Regs.getReg(rs)
+		shifter = utils.LoShiftR(vrm, uint8(vrs))
+		var vrss = uint8(getBits(vrs, 0, 7))
+		if vrss == 0 {
+			shCarry = cpu.Regs.getFlag('C')
+		} else if vrss <= 32 {
+			shCarry = getBits(vrm, vrss-1, vrss-1) == 1
+		} else {
+			shifter = 0
+			shCarry = false
+		}
+	case 4: //arithmetic shift right by immediate
+		var shiftImm uint8
+		shiftImm = uint8(inst.getBits(7, 11))
+		if shiftImm == 0 {
+			if getBits(vrm, 31, 31) == 0 {
+				shifter = 0
+				shCarry = getBits(vrm, 31, 31) == 1
+			} else {
+				shifter = 0xffffffff
+				shCarry = getBits(vrm, 31, 31) == 1
+			}
+		} else {
+			shifter = utils.ArShiftR(vrm, shiftImm)
+			shCarry = getBits(vrm, shiftImm-1, shiftImm-1) == 1
+		}
+	case 5: //arithmetic shift right by register
+		var rs uint8
+		rs = uint8(inst.getBits(8, 11))
+		var vrs uint32
+		vrs = cpu.Regs.getReg(rs)
+		shifter = utils.ArShiftR(vrm, uint8(getBits(vrs, 0, 3)))
+		var vrss = uint8(getBits(vrs, 0, 7))
+		if vrss == 0 {
+			shCarry = cpu.Regs.getFlag('C')
+		} else if vrss < 32 {
+			shCarry = getBits(vrm, vrss-1, vrss-1) == 1
+		} else {
+			if getBits(vrm, 31, 31) == 0 {
+				shifter = 0
+				shCarry = getBits(vrm, 31, 31) == 1
+			} else {
+				shifter = 0xffffffff
+				shCarry = getBits(vrm, 31, 31) == 1
+			}
+		}
+	case 6: //rotate right by immediate
+		var shiftImm uint8
+		shiftImm = uint8(inst.getBits(7, 11))
+		if shiftImm == 0 {
+			shifter = (uint32(bool2uint8(cpu.Regs.getFlag('C'))) << 31) | (vrm >> 1)
+			shCarry = getBits(vrm, 0, 0) == 1
+		} else {
+			shifter = bits.RotateLeft32(vrm, -1*int(shiftImm))
+			shCarry = getBits(vrm, shiftImm-1, shiftImm-1) == 1
+		}
+
+	case 7: //rotate right by register
+		var rs uint8
+		rs = uint8(inst.getBits(8, 11))
+		var vrs uint32
+		vrs = cpu.Regs.getReg(rs)
+		var vrss = uint8(getBits(vrs, 0, 7))
+		if vrss == 0 {
+			shifter = vrm
+			shCarry = cpu.Regs.getFlag('C')
+		} else if getBits(vrs, 0, 4) == 0 {
+			shifter = vrm
+			shCarry = getBits(vrm, 31, 31) == 1
+		} else {
+			shifter = bits.RotateLeft32(vrm, -1*int(getBits(vrs, 0, 4)))
+			shCarry = getBits(vrm, uint8(getBits(vrs, 0, 4)-1), uint8(getBits(vrs, 0, 4))) == 1
 		}
 	}
 	name = fmt.Sprintf("#0x%x", shifter)
@@ -421,6 +445,7 @@ func (cpu *CPU) setLSAddr(inst *InstructionArm32) (address uint32, dn, sn string
 					}
 				}
 			case 1:
+				fmt.Printf("addr:%x\n", vrn)
 				if ubit {
 					sn = fmt.Sprintf("{r%d+#0x%x}=%x", rn, offset, vrn+offset)
 					address = vrn + offset
@@ -437,8 +462,7 @@ func (cpu *CPU) setLSAddr(inst *InstructionArm32) (address uint32, dn, sn string
 				if ubit {
 					sn = fmt.Sprintf("{r%d+r%d}=%x", rn, rm, vrn+vrm)
 					address = vrn + vrm
-				} else
-				{
+				} else {
 					sn = fmt.Sprintf("{r%d-r%d}=%x", rn, rm, vrn-vrm)
 					address = vrn - vrm
 				}
@@ -448,6 +472,8 @@ func (cpu *CPU) setLSAddr(inst *InstructionArm32) (address uint32, dn, sn string
 					cpu.Regs.setReg(rn, address)
 				}
 			case 1: //immediate pre-indexed
+
+				fmt.Printf("adddr:%x", cpu.Regs.getReg(15))
 				if ubit {
 					sn = fmt.Sprintf("{r%d+#0x%x}=%x", rn, offset, vrn+offset)
 					address = vrn + offset
@@ -537,29 +563,29 @@ func (cpu *CPU) dpxs(inst *InstructionArm32, shifter uint32) error {
 	switch inst.OpCode {
 	case 0x0: //AND:logical and
 		//4.1.4, 3.13: extending the instruction set. this isn't AND instruction
-		if inst.getBit(25)==false&&(inst.getBit(4)==true&&inst.getBit(7)==true){
+		if inst.getBit(25) == false && (inst.getBit(4) == true && inst.getBit(7) == true) {
 			//3.13.1 undefined
-			if inst.getBits(25,27)==3&&inst.getBit(4)==true{
+			if inst.getBits(25, 27) == 3 && inst.getBit(4) == true {
 				panic(errors.New("UNDEFINED"))
 			}
 			//3.13.2 arithmetic instruction extension space
-			if inst.getBits(24,27)==0&&inst.getBits(4,7)==9&&inst.getBits(28,31)!=15{
-				opc := inst.getBits(21,23)
+			if inst.getBits(24, 27) == 0 && inst.getBits(4, 7) == 9 && inst.getBits(28, 31) != 15 {
+				opc := inst.getBits(21, 23)
 				switch opc {
 				//todo: assembly of MUL is't implemented adequately
-				case 0://MUL,MULS
-				inst.Mnemonic = "MUL"
-					vrm:=cpu.Regs.getReg(uint8(inst.getBits(0,3)))
-					vrs:=cpu.Regs.getReg(uint8(inst.getBits(8,11)))
-					rd=uint8(inst.getBits(16,19))
-					vrd = vrm*vrs
-					if s{
-						n=getBit(vrd,31)
-						z=vrd==0
+				case 0: //MUL,MULS
+					inst.Mnemonic = "MUL"
+					vrm := cpu.Regs.getReg(uint8(inst.getBits(0, 3)))
+					vrs := cpu.Regs.getReg(uint8(inst.getBits(8, 11)))
+					rd = uint8(inst.getBits(16, 19))
+					vrd = vrm * vrs
+					if s {
+						n = getBit(vrd, 31)
+						z = vrd == 0
 					}
 				}
 			}
-		}else {
+		} else {
 			inst.Mnemonic = "AND"
 			vrd = cpu.Regs.getReg(rn) & shifter
 			if s {
@@ -686,6 +712,96 @@ func (cpu *CPU) dpxs(inst *InstructionArm32, shifter uint32) error {
 	cpu.Regs.setFlag('V', v)
 	return nil
 }
+
+func (cpu *CPU) getLSMAddr(inst *InstructionArm32) (startAddr, endAddr uint32) {
+	//See A5.4 Addressing Mode 4- Load and Store Multiple
+	var rn uint8
+	rn = uint8(inst.getBits(16, 19))
+	var vrn uint32
+	vrn = cpu.Regs.getReg(rn)
+	cond, _ := cpu.checkCond(inst)
+	numberOfBitsx4 := uint32(4 * bits.OnesCount32(inst.getBits(0, 15)))
+	if inst.getBit(23) {
+		//Ubit is 1
+		if !inst.getBit(24) {
+			//Pbit is 0, Increment after
+			startAddr = vrn
+			endAddr = vrn + numberOfBitsx4 - 4
+			if cond && inst.getBit(21) {
+				vrn = vrn + numberOfBitsx4
+			}
+		} else {
+			//Increment before
+			startAddr = vrn + 4
+			endAddr = vrn - numberOfBitsx4
+			if cond && inst.getBit(21) {
+				vrn = vrn - numberOfBitsx4
+			}
+		}
+	} else {
+		if !inst.getBit(24) {
+			//Decrement after
+			startAddr = vrn - numberOfBitsx4 + 4
+			endAddr = vrn
+			if cond && inst.getBit(21) {
+				vrn = vrn - numberOfBitsx4
+			}
+		} else {
+			//Decrement before
+			startAddr = vrn - numberOfBitsx4
+			endAddr = vrn - 4
+			if cond && inst.getBit(21) {
+				vrn = vrn - numberOfBitsx4
+			}
+		}
+	}
+	cpu.Regs.setReg(rn, vrn)
+	return startAddr, endAddr
+}
+
+func (cpu *CPU) doLSM(inst *InstructionArm32, startAddr, endAddr uint32) error {
+	//todo: what is meomoryaccess(b-bit,e-bit)????
+	//todo LDM(2),LDM(3) isn't implemented
+	cond, _ := cpu.checkCond(inst)
+	if !cond {
+		return nil
+	}
+	if inst.getBit(20) {
+		//Load
+		inst.Mnemonic = "LDM"
+		addr := startAddr
+		for i := uint8(0); i < 14; i++ {
+			if inst.getBit(i) {
+				cpu.Regs.setReg(i, cpu.mem.Fetch32bits(addr))
+				addr += 4
+			}
+		}
+		if inst.getBit(15) {
+			value := cpu.mem.Fetch32bits(addr)
+			cpu.Regs.setReg(15, value&0xFFFFFFFE)
+			cpu.Regs.setFlag('T', value&1 == 1)
+		}
+		addr = addr + 4
+		if addr != endAddr {
+			return errors.New("startAddr and endAddr is mismatched")
+		}
+	} else {
+		inst.Mnemonic = "STM"
+		addr := startAddr
+		for i := uint8(0); i < 14; i++ {
+			if inst.getBit(i) {
+				cpu.mem.Write32bits(addr, cpu.Regs.getReg(i))
+				addr = addr + 4
+				//Shared is not implemented
+			}
+		}
+		if addr != endAddr-4 {
+			return errors.New("startAddr and endAddr is mismatched")
+		}
+	}
+	return nil
+}
+
 func (cpu *CPU) doLS(inst *InstructionArm32, addr uint32) error { //store multiple isn't defined
 	var rd uint8
 	rd = uint8(inst.getBits(12, 15))
@@ -711,7 +827,9 @@ func (cpu *CPU) doLS(inst *InstructionArm32, addr uint32) error { //store multip
 		case 0:
 			inst.Mnemonic = "LDR"
 			var v, m uint32
-			m = cpu.mem.Fetch32bits(addr)
+			m = cpu.mem.Fetch32bits(addr+4)
+			//bug!!!!!! why is +4 required?????????
+
 			switch addr & 3 {
 			case 0:
 				v = m
@@ -729,7 +847,7 @@ func (cpu *CPU) doLS(inst *InstructionArm32, addr uint32) error { //store multip
 			}
 		case 1:
 			inst.Mnemonic = "LDRB"
-			cpu.Regs.setReg(rd, uint32(cpu.mem.Fetchbyte(addr)))
+			cpu.Regs.setReg(rd, uint32(cpu.mem.Fetch32bits(addr)))
 		}
 	}
 	return nil
@@ -740,16 +858,17 @@ func (cpu *CPU) branch(inst *InstructionArm32) error {
 	if !cond {
 		return nil
 	}
-	if inst.getBit(24)==true {
-		cpu.Regs.setReg(14, cpu.Regs.getReg(15)+4)
+	if inst.getBit(24) == true {
+		cpu.Regs.setReg(14, cpu.Regs.getReg(15))
 	}
 	var off uint32
-	if inst.getBit(23)==true{//sign
-		off=inst.getBits(0,23)|0xff000000
-	}else{
-		off=inst.getBits(0,23)
+	if inst.getBit(23) == true { //sign
+		off = inst.getBits(0, 23) | 0xff000000
+	} else {
+		off = inst.getBits(0, 23)
 	}
-	off=off<<2
+	off = off << 2
+	//bug when is pc incremented?????
 	cpu.Regs.setReg(15, uint32(cpu.Regs.getReg(15)+off))
 	return nil
 }
@@ -761,24 +880,32 @@ func bool2uint8(b bool) uint8 {
 	}
 }
 
-func (cpu *CPU) Exec(mem *memory.Memory) {
-	for i := 0; i < 1000; i++ {
+func (cpu *CPU) Start() {
+	for i := 0; i < 40; i++ {
 		if cpu.Regs.getReg(15)&1 == 1 { //thumb
-			i := mem.Fetch16bits(cpu.Regs.getReg(15) &^ 1)
+			i := cpu.mem.Fetch16bits(cpu.Regs.getRawR15() &^ 1)
 			inst := &InstructionThumb{}
 			inst.set(uint16(i))
 			cpu.execThumb(inst)
 			fmt.Printf("%s:%x,%x\n", inst.Mnemonic, cpu.Regs.getReg(15), inst.Inst)
-			cpu.Regs.setReg(15, cpu.Regs.getReg(15)+2)
+            //bug
+            cpu.Regs.incrementPC()
 		} else { //arm32
-			i := mem.Fetch32bits(cpu.Regs.getReg(15) &^ uint32(1))
+			i := cpu.mem.Fetch32bits(cpu.Regs.getRawR15() &^ uint32(1))
+            cpu.Regs.incrementPC()
+
 			inst := &InstructionArm32{}
 			inst.set(i)
-			fmt.Printf("%x\n",inst.Inst)
 			//fmt.Println(inst.Cond)
 			cpu.execArm32(inst)
-			fmt.Printf("%x:%x:%s %s, %s, %s, %s\n", cpu.Regs.getReg(15), inst.Inst, inst.Mnemonic, inst.Condition, inst.Destination, inst.Source, inst.Immediate)
-			cpu.Regs.setReg(15, cpu.Regs.getReg(15)+4)
+			fmt.Printf("%x:%x:%s.%s, %s, %s, %s\n", cpu.Regs.getReg(15), inst.Inst, inst.Mnemonic, inst.Condition, inst.Destination, inst.Source, inst.Immediate)
+            if inst.Mnemonic ==""{
+                fmt.Print("\n\n!!!!UNDEFINED!!!\n\n")
+            }
+		}
+		if i == 6 {
+			cpu.mem.Dump()
+			fmt.Println("file write ok.")
 		}
 		for i := uint8(0); i < 4; i++ {
 			fmt.Printf("r%2d:%8x r%2d:%8x r%2d:%8x r%2d:%8x \n",
