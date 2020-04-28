@@ -76,20 +76,21 @@ func (regs *Registers) setFlag(c rune, b bool) {
 func (regs *Registers) setReg(n uint8, v uint32) {
 	regs.register[n] = v
 }
-func (regs *Registers) getRawR15() uint32{
-    return regs.register[15]
+func (regs *Registers) getRawR15() uint32 {
+	return regs.register[15]
 }
 func (regs *Registers) getReg(n uint8) uint32 {
-    if n!=15{
-	    return regs.register[n]
-    }else{
-        return regs.register[n]+4
-        //when pc is read, pc return the instruction address + 8byte. pc is already incremented after fetch, so +4byte is required.
-    }
+	if n != 15 {
+		return regs.register[n]
+	} else {
+		return regs.register[n] + 4
+		//when pc is read, pc return the instruction address + 8byte. pc is already incremented after fetch, so +4byte is required.
+	}
 }
-func (regs *Registers) incrementPC(){
-    regs.register[15]+=4
+func (regs *Registers) incrementPC() {
+	regs.register[15] += 4
 }
+
 /*
 ModeBit | Mode | Accessible registers
 0b10000 | User | PC, R14 to R0, CPSR
@@ -227,11 +228,23 @@ func (cpu *CPU) execArm32(inst *InstructionArm32) error {
 	case 0x0: //Data Processing
 		if inst.getBits(23, 24) == 2 && inst.getBit(20) == false {
 			//Miscellaneous instruction
+            //TODO: See A3.16.3
+			if inst.getBits(20, 27) == 22 /*0b00010110*/ && inst.getBits(4, 7) == 1 {
+				//CLZ
+				inst.Mnemonic = "CLZ"
+				rm := uint8(inst.getBits(0, 3))
+				vrm := cpu.Regs.getReg(rm)
+				rd := uint8(inst.getBits(12, 15))
+				vrd := uint32(bits.LeadingZeros32(vrm))
+				cpu.Regs.setReg(rd, vrd)
+				return nil
+			}
 			return errors.New("Miscellaneous instruction is not implemented")
 		}
 		shifter, _, shname := cpu.setDPShifter(inst)
 		inst.Immediate = shname
 		if !cond {
+			inst.Mnemonic = "\x1b[31mNOP\x1b[0m"
 			return nil
 		}
 		cpu.dpxs(inst, shifter)
@@ -250,6 +263,7 @@ func (cpu *CPU) execArm32(inst *InstructionArm32) error {
 		cpu.Regs.setFlag('C', shCarry)
 		inst.Immediate = fmt.Sprintf("#0x%x", shifter)
 		if !cond {
+			inst.Mnemonic = "\x1b[31mNOP\x1b[0m"
 			return nil
 		}
 		cpu.dpxs(inst, shifter)
@@ -262,12 +276,14 @@ func (cpu *CPU) execArm32(inst *InstructionArm32) error {
 		cpu.doLS(inst, address)
 	case 0x4: //Load&Store multiple instructions
 		startAddr, endAddr := cpu.getLSMAddr(inst)
+		fmt.Printf("start:end=%x:%x\n", startAddr, endAddr)
 		err := cpu.doLSM(inst, startAddr, endAddr)
 		if err != nil {
 			return err
 		}
 	case 0x5: //B
 		if !cond {
+			inst.Mnemonic = "\x1b[31mNOP\x1b[0m"
 			return nil
 		}
 		cpu.branch(inst)
@@ -445,7 +461,6 @@ func (cpu *CPU) setLSAddr(inst *InstructionArm32) (address uint32, dn, sn string
 					}
 				}
 			case 1:
-				fmt.Printf("addr:%x\n", vrn)
 				if ubit {
 					sn = fmt.Sprintf("{r%d+#0x%x}=%x", rn, offset, vrn+offset)
 					address = vrn + offset
@@ -733,9 +748,9 @@ func (cpu *CPU) getLSMAddr(inst *InstructionArm32) (startAddr, endAddr uint32) {
 		} else {
 			//Increment before
 			startAddr = vrn + 4
-			endAddr = vrn - numberOfBitsx4
+			endAddr = vrn + numberOfBitsx4
 			if cond && inst.getBit(21) {
-				vrn = vrn - numberOfBitsx4
+				vrn = vrn + numberOfBitsx4
 			}
 		}
 	} else {
@@ -780,28 +795,34 @@ func (cpu *CPU) doLSM(inst *InstructionArm32, startAddr, endAddr uint32) error {
 			value := cpu.mem.Fetch32bits(addr)
 			cpu.Regs.setReg(15, value&0xFFFFFFFE)
 			cpu.Regs.setFlag('T', value&1 == 1)
+			addr = addr + 4
 		}
-		addr = addr + 4
-		if addr != endAddr {
+		if endAddr != addr-4 {
 			return errors.New("startAddr and endAddr is mismatched")
 		}
 	} else {
 		inst.Mnemonic = "STM"
+		inst.Destination = "{"
 		addr := startAddr
-		for i := uint8(0); i < 14; i++ {
+		for i := uint8(0); i < 15; i++ {
 			if inst.getBit(i) {
 				cpu.mem.Write32bits(addr, cpu.Regs.getReg(i))
 				addr = addr + 4
+				inst.Destination += fmt.Sprintf("r%d, ", i)
 				//Shared is not implemented
 			}
 		}
-		if addr != endAddr-4 {
+		inst.Destination += "}"
+		if endAddr != addr-4 {
+			fmt.Printf("%x\n", addr-4)
 			return errors.New("startAddr and endAddr is mismatched")
 		}
 	}
 	return nil
 }
 
+func (cpu *CPU) addr() {
+}
 func (cpu *CPU) doLS(inst *InstructionArm32, addr uint32) error { //store multiple isn't defined
 	var rd uint8
 	rd = uint8(inst.getBits(12, 15))
@@ -827,7 +848,7 @@ func (cpu *CPU) doLS(inst *InstructionArm32, addr uint32) error { //store multip
 		case 0:
 			inst.Mnemonic = "LDR"
 			var v, m uint32
-			m = cpu.mem.Fetch32bits(addr+4)
+			m = cpu.mem.Fetch32bits(addr + 4)
 			//bug!!!!!! why is +4 required?????????
 
 			switch addr & 3 {
@@ -868,7 +889,6 @@ func (cpu *CPU) branch(inst *InstructionArm32) error {
 		off = inst.getBits(0, 23)
 	}
 	off = off << 2
-	//bug when is pc incremented?????
 	cpu.Regs.setReg(15, uint32(cpu.Regs.getReg(15)+off))
 	return nil
 }
@@ -881,37 +901,68 @@ func bool2uint8(b bool) uint8 {
 }
 
 func (cpu *CPU) Start() {
-	for i := 0; i < 40; i++ {
+	for i := 0; i < 50; i++ {
 		if cpu.Regs.getReg(15)&1 == 1 { //thumb
 			i := cpu.mem.Fetch16bits(cpu.Regs.getRawR15() &^ 1)
 			inst := &InstructionThumb{}
 			inst.set(uint16(i))
 			cpu.execThumb(inst)
 			fmt.Printf("%s:%x,%x\n", inst.Mnemonic, cpu.Regs.getReg(15), inst.Inst)
-            //bug
-            cpu.Regs.incrementPC()
+			//bug
+			cpu.Regs.incrementPC()
 		} else { //arm32
 			i := cpu.mem.Fetch32bits(cpu.Regs.getRawR15() &^ uint32(1))
-            cpu.Regs.incrementPC()
+			cpu.Regs.incrementPC()
 
 			inst := &InstructionArm32{}
 			inst.set(i)
 			//fmt.Println(inst.Cond)
-			cpu.execArm32(inst)
+			err := cpu.execArm32(inst)
+			if err != nil {
+				fmt.Println(err)
+				cpu.dumpDebugInfo(inst)
+				return
+			}
 			fmt.Printf("%x:%x:%s.%s, %s, %s, %s\n", cpu.Regs.getReg(15), inst.Inst, inst.Mnemonic, inst.Condition, inst.Destination, inst.Source, inst.Immediate)
-            if inst.Mnemonic ==""{
-                fmt.Print("\n\n!!!!UNDEFINED!!!\n\n")
-            }
+			if inst.Mnemonic == "" {
+				fmt.Print("\x1b[31m!!!!UNDEFINED!!!!\x1b[0m\n")
+				cpu.dumpDebugInfo(inst)
+				return
+			}
 		}
 		if i == 6 {
 			cpu.mem.Dump()
 			fmt.Println("file write ok.")
 		}
-		for i := uint8(0); i < 4; i++ {
-			fmt.Printf("r%2d:%8x r%2d:%8x r%2d:%8x r%2d:%8x \n",
-				i*4, cpu.Regs.getReg(i*4), i*4+1, cpu.Regs.getReg(i*4+1), i*4+2, cpu.Regs.getReg(i*4+2), i*4+3, cpu.Regs.getReg(i*4+3))
-		}
+		cpu.dumpRegisters()
 		//fmt.Printf("flags N:%t, Z:%t, C:%t, V:%t \n\n", cpu.Regs.getFlag('N'), cpu.Regs.getFlag('Z'), cpu.Regs.getFlag('C'), cpu.Regs.getFlag('V'))
+	}
+}
+func (cpu *CPU) dumpDebugInfo(inst *InstructionArm32) {
+	var instBinary string
+	for i := 1; i < 33; i++ {
+		if (inst.Inst>>(32-i))&1 == 1 {
+			instBinary += "1"
+		} else {
+			instBinary += "0"
+		}
+		if i%4 == 0 {
+			if i%8 != 0 {
+				instBinary += " "
+			} else {
+				instBinary += " | "
+			}
+		}
+	}
+	fmt.Println(instBinary)
+	fmt.Printf("%x:%x:%s.%s, %s, %s, %s\n", cpu.Regs.getReg(15), inst.Inst, inst.Mnemonic, inst.Condition, inst.Destination, inst.Source, inst.Immediate)
+	cpu.dumpRegisters()
+	fmt.Printf("flags N:%t, Z:%t, C:%t, V:%t \n\n", cpu.Regs.getFlag('N'), cpu.Regs.getFlag('Z'), cpu.Regs.getFlag('C'), cpu.Regs.getFlag('V'))
+}
+func (cpu *CPU) dumpRegisters() {
+	for i := uint8(0); i < 4; i++ {
+		fmt.Printf("r%2d:%8x r%2d:%8x r%2d:%8x r%2d:%8x \n",
+			i*4, cpu.Regs.getReg(i*4), i*4+1, cpu.Regs.getReg(i*4+1), i*4+2, cpu.Regs.getReg(i*4+2), i*4+3, cpu.Regs.getReg(i*4+3))
 	}
 }
 
