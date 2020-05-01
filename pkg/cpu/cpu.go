@@ -226,9 +226,22 @@ func (cpu *CPU) execArm32(inst *InstructionArm32) error {
 	inst.Condition = name
 	switch inst.OpType {
 	case 0x0: //Data Processing
+		if !cond {
+			inst.Mnemonic = "\x1b[31mNOP\x1b[0m"
+			return nil
+		}
 		if inst.getBits(23, 24) == 2 && inst.getBit(20) == false {
 			//Miscellaneous instruction
-            //TODO: See A3.16.3
+            if inst.getBits(26,27)==0&&inst.getBits(23,24)==2&&inst.getBit(20)==false&&inst.getBits(28,31)!=0xf{
+            //Control and DSP instruction space
+            //MRS,MSR,BX,CLZ,BXJ,BLX,QADD,QDADD,QDSUB,BKPT,SMLA,SMLAW,SMULW,SMLAL,SMUL,MSR
+            if inst.getBit(25)==false{
+                if inst.getBit(4)==false{
+                }else{
+
+                }
+            }
+            }
 			if inst.getBits(20, 27) == 22 /*0b00010110*/ && inst.getBits(4, 7) == 1 {
 				//CLZ
 				inst.Mnemonic = "CLZ"
@@ -243,10 +256,6 @@ func (cpu *CPU) execArm32(inst *InstructionArm32) error {
 		}
 		shifter, _, shname := cpu.setDPShifter(inst)
 		inst.Immediate = shname
-		if !cond {
-			inst.Mnemonic = "\x1b[31mNOP\x1b[0m"
-			return nil
-		}
 		cpu.dpxs(inst, shifter)
 	case 0x1: //Data Processing immediate
 		var imm uint32
@@ -814,14 +823,15 @@ func (cpu *CPU) doLSM(inst *InstructionArm32, startAddr, endAddr uint32) error {
 		}
 		inst.Destination += "}"
 		if endAddr != addr-4 {
-			fmt.Printf("%x\n", addr-4)
 			return errors.New("startAddr and endAddr is mismatched")
 		}
 	}
 	return nil
 }
 
-func (cpu *CPU) addr() {
+func (cpu *CPU) doMS(inst *InstructionArm32) error{
+    
+    return nil
 }
 func (cpu *CPU) doLS(inst *InstructionArm32, addr uint32) error { //store multiple isn't defined
 	var rd uint8
